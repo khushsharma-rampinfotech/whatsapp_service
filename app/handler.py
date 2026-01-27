@@ -73,6 +73,7 @@ def clear_session(phone: str):
 # WHATSAPP SENDER
 # --------------------------------------------------
 def send_whatsapp_reply(to: str, text: str, reply_to: str):
+    
     requests.post(
         f"{BASE_URL}/{PHONE_NUMBER_ID}/messages",
         headers={
@@ -92,6 +93,35 @@ def send_whatsapp_reply(to: str, text: str, reply_to: str):
 # --------------------------------------------------
 # DB HELPERS (CLAIM)
 # --------------------------------------------------
+def fetch_entities_for_employee(emp_no: int):
+    conn = pyodbc.connect(CONN_STR)
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT
+            eem.entity_id,
+            em.entity_name
+        FROM product.EmployeeEntityMapping eem
+        JOIN zeus_t1.EntityMaster em
+            ON em.entity_id = eem.entity_id
+        WHERE eem.emp_no = ?
+          AND (eem.is_disabled = 0 OR eem.is_disabled IS NULL)
+          AND em.deleted_on IS NULL
+        ORDER BY em.entity_name
+        """,
+        emp_no,
+    )
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return [
+        {"entity_id": r.entity_id, "entity_name": r.entity_name}
+        for r in rows
+    ]
+
 def fetch_employee_context(phone: str):
     conn = pyodbc.connect(CONN_STR)
     cur = conn.cursor()
@@ -186,37 +216,68 @@ def process_grn_async(phone, path, reply_to):
 # CLAIM OCR
 # --------------------------------------------------
 def process_claim_async(phone, reply_to):
-    images = redis_client.lrange(rkey(phone, "images"), 0, -1)
-    emp_no = int(redis_client.get(rkey(phone, "emp_no")))
-    schema = redis_client.get(rkey(phone, "schema"))
-    entity_id = redis_client.get(rkey(phone, "entity_id"))
+    try:
+        images = redis_client.lrange(rkey(phone, "images"), 0, -1)
+        emp_no = int(redis_client.get(rkey(phone, "emp_no")))
+        schema = redis_client.get(rkey(phone, "schema"))
+        entity_id = redis_client.get(rkey(phone, "entity_id"))
 
-    extracted = []
-    for img in images:
-        extracted.append(run_invoice_ocr(img).get("structured") or {})
+        # ---------- OCR ----------
+        extracted = []
+        for img in images:
+            extracted.append(run_invoice_ocr(img).get("structured") or {})
 
-    redis_client.setex(
-        rkey(phone, "extracted_bills"),
-        CHAT_TTL,
-        json.dumps(extracted),
-    )
+        redis_client.setex(
+            rkey(phone, "extracted_bills"),
+            CHAT_TTL,
+            json.dumps(extracted),
+        )
 
-    draft = get_latest_drafted_claim(schema, emp_no, entity_id)
-    redis_client.setex(rkey(phone, "draft_claim_no"), CHAT_TTL, draft or "")
+        # ---------- 🔥 IMPORTANT FIX ----------
+        # If a claim is already active, DO NOT ask draft question again.
+        active_claim = redis_client.get(rkey(phone, "active_claim_no"))
 
-    redis_client.setex(
-        rkey(phone, "state"),
-        CHAT_TTL,
-        STATE_WAITING_FOR_CLAIM_CHOICE,
-    )
+        if active_claim:
+            # Reuse same claim and auto-commit
+            redis_client.setex(
+                rkey(phone, "draft_claim_no"),
+                CHAT_TTL,
+                int(active_claim),
+            )
 
-    send_whatsapp_reply(
-        phone,
-        f"📝 Draft claim found (Claim No: {draft})\n1️⃣ Add to existing\n2️⃣ Create new"
-        if draft else
-        "ℹ️ No draft claim found\n2️⃣ Create new claim",
-        reply_to,
-    )
+            # Directly attach to existing claim
+            threading.Thread(
+                target=commit_claim,
+                args=(phone, "1", reply_to),  # force "Add to existing"
+                daemon=True,
+            ).start()
+            return
+
+        # ---------- FIRST INVOICE ONLY ----------
+        draft = get_latest_drafted_claim(schema, emp_no, entity_id)
+        redis_client.setex(rkey(phone, "draft_claim_no"), CHAT_TTL, draft or "")
+
+        redis_client.setex(
+            rkey(phone, "state"),
+            CHAT_TTL,
+            STATE_WAITING_FOR_CLAIM_CHOICE,
+        )
+
+        send_whatsapp_reply(
+            phone,
+            f"📝 Draft claim found (Claim No: {draft})\n1️⃣ Add to existing\n2️⃣ Create new"
+            if draft else
+            "ℹ️ No draft claim found\n2️⃣ Create new claim",
+            reply_to,
+        )
+
+    except Exception as e:
+        send_whatsapp_reply(
+            phone,
+            f"❌ OCR failed.\n{e}",
+            reply_to,
+        )
+
 
 # --------------------------------------------------
 # CLAIM COMMIT (FINAL STEP)
@@ -231,7 +292,7 @@ def commit_claim(phone, choice, reply_to):
         images = redis_client.lrange(rkey(phone, "images"), 0, -1)
 
         draft_raw = redis_client.get(rkey(phone, "draft_claim_no"))
-        draft_claim_no = int(draft_raw) if draft_raw else None
+        draft_claim_no = int(draft_raw) if draft_raw else None 
 
         # 🔐 Login
         auth = login_with_phone(phone)
@@ -240,11 +301,11 @@ def commit_claim(phone, choice, reply_to):
         et_id, est_id = resolve_expense_type_ids(schema)
 
         prepared_bills = []
-        total_amount = 0.0
+        invoice_amount = 0.0  # amount for THIS upload only
 
         for bill in bills:
             amount = float(bill.get("amount") or 0)
-            total_amount += amount
+            invoice_amount += amount
 
             from_date = normalize_date(bill.get("from_date"))
             to_date = normalize_date(bill.get("to_date")) or from_date
@@ -265,27 +326,32 @@ def commit_claim(phone, choice, reply_to):
                 "claim_description": "Created via WhatsApp",
                 "emp_id": emp_no,
                 "entity_id": entity_id,
-                "total_claim_amount": total_amount,
+                "total_claim_amount": invoice_amount,  # backend recalculates anyway
                 "claim_status": "Drafted",
             },
             "bills": prepared_bills,
         }
 
-        url = (
-            f"{CLAIMIFY_API_BASE}/api/claims/{draft_claim_no}"
-            if choice == "1" and draft_claim_no
-            else f"{CLAIMIFY_API_BASE}/api/claims"
-        )
+        headers = {
+            "X-Session-Id": session_id,
+            "Content-Type": "application/json",
+        }
 
-        resp = requests.post(
-            url,
-            json=payload,
-            headers={
-                "X-Session-Id": session_id,
-                "Content-Type": "application/json",
-            },
-            timeout=60,
-        )
+        # 🔥 POST vs PUT
+        if choice == "1" and draft_claim_no:
+            resp = requests.put(
+                f"{CLAIMIFY_API_BASE}/api/claims/{draft_claim_no}",
+                json=payload,
+                headers=headers,
+                timeout=60,
+            )
+        else:
+            resp = requests.post(
+                f"{CLAIMIFY_API_BASE}/api/claims",
+                json=payload,
+                headers=headers,
+                timeout=60,
+            )
 
         if resp.status_code != 200:
             raise Exception(resp.text)
@@ -293,7 +359,13 @@ def commit_claim(phone, choice, reply_to):
         data = resp.json()
         claim_no = data["claim_no"]
 
-        # ✅ FIXED: keyword-only arguments
+        # 🔹 Authoritative total from backend
+        total_claim_amount = (
+            data.get("claim", {}).get("total_claim_amount")
+            or data.get("total_claim_amount")
+        )
+
+        # ✅ Attach invoice images
         for bill in data["bills"]:
             upload_bill_attachments(
                 session_id=session_id,
@@ -302,13 +374,40 @@ def commit_claim(phone, choice, reply_to):
                 files=[Path(p) for p in images],
             )
 
+        # 🔹 Format amounts
+        invoice_text = f"🧾 Invoice Amount: ₹ {invoice_amount:,.2f}"
+        total_text = (
+            f"\n💰 Total Claim Amount: ₹ {float(total_claim_amount):,.2f}"
+            if total_claim_amount is not None
+            else ""
+        )
+
+        # 🔁 Ask user to add more invoices
         send_whatsapp_reply(
             phone,
-            f"✅ Claim saved successfully (Draft)\nClaim No: {claim_no}",
+            f"✅ Invoice attached successfully\n"
+            f"📄 Claim No: {claim_no}\n"
+            f"{invoice_text}"
+            f"{total_text}\n\n"
+            "Do you want to add another invoice?\n"
+            "1️⃣ Yes\n"
+            "2️⃣ Done",
             reply_to,
         )
 
-        clear_session(phone)
+        # 🔹 Persist active claim
+        redis_client.setex(
+            rkey(phone, "active_claim_no"),
+            CHAT_TTL,
+            claim_no,
+        )
+
+        # 🔹 Move to add-more decision state
+        redis_client.setex(
+            rkey(phone, "state"),
+            CHAT_TTL,
+            STATE_WAITING_FOR_ADD_MORE,
+        )
 
     except Exception as e:
         send_whatsapp_reply(
@@ -316,6 +415,8 @@ def commit_claim(phone, choice, reply_to):
             f"❌ Failed to save claim\n{e}",
             reply_to,
         )
+
+
 
 
 # --------------------------------------------------
@@ -333,9 +434,10 @@ def handle_whatsapp_incoming(data):
 
     # ---------------- TEXT ----------------
     if msg_type == "text":
-        text = msg["text"]["body"].strip()
+        text = msg["text"]["body"].strip().lower()
 
-        if text.lower() in ("hi", "start"):
+        # ---- START ----
+        if text in ("hi", "start"):
             clear_session(sender)
             emp_no, tenant = fetch_employee_context(sender)
             if not emp_no:
@@ -353,35 +455,118 @@ def handle_whatsapp_incoming(data):
             )
             return
 
+        # ---- SERVICE ----
         if state == STATE_WAITING_FOR_SERVICE:
             if text == "1":
-                redis_client.setex(rkey(sender, "state"), CHAT_TTL, STATE_WAITING_FOR_ENTITY)
-                send_whatsapp_reply(sender, "Select entity:\n1️⃣ EN0001\n2️⃣ EN0010", msg_id)
-                return
-            if text == "2":
-                redis_client.setex(rkey(sender, "state"), CHAT_TTL, STATE_WAITING_FOR_GRN_UPLOAD)
-                send_whatsapp_reply(sender, "📎 Please send GRN image or PDF.", msg_id)
+                emp_no = int(redis_client.get(rkey(sender, "emp_no")))
+                entities = fetch_entities_for_employee(emp_no)
+
+                if not entities:
+                    send_whatsapp_reply(
+                        sender,
+                        "❌ You are not mapped to any entity. Please contact support.",
+                        msg_id,
+                    )
+                    clear_session(sender)
+                    return
+
+                # Store entity list for selection mapping
+                redis_client.setex(
+                    rkey(sender, "entities"),
+                    CHAT_TTL,
+                    json.dumps(entities),
+                )
+
+                redis_client.setex(
+                    rkey(sender, "state"),
+                    CHAT_TTL,
+                    STATE_WAITING_FOR_ENTITY,
+                )
+
+                lines = ["Select entity:"]
+                for idx, e in enumerate(entities, start=1):
+                    lines.append(f"{idx}️⃣ {e['entity_name']}")
+
+                send_whatsapp_reply(sender, "\n".join(lines), msg_id)
                 return
 
+            if text == "2":
+                redis_client.setex(
+                    rkey(sender, "state"),
+                    CHAT_TTL,
+                    STATE_WAITING_FOR_GRN_UPLOAD,
+                )
+                send_whatsapp_reply(
+                    sender,
+                    "📎 Please send GRN image or PDF.",
+                    msg_id,
+                )
+                return
+
+        # ---- ENTITY ----
         if state == STATE_WAITING_FOR_ENTITY:
+            entities_raw = redis_client.get(rkey(sender, "entities"))
+            if not entities_raw:
+                send_whatsapp_reply(sender, "⚠️ Session expired. Please type Hi.", msg_id)
+                clear_session(sender)
+                return
+
+            entities = json.loads(entities_raw)
+
+            try:
+                idx = int(text) - 1
+                entity_id = entities[idx]["entity_id"]
+            except (ValueError, IndexError):
+                send_whatsapp_reply(
+                    sender,
+                    "❌ Invalid selection. Please choose a valid number.",
+                    msg_id,
+                )
+                return
+
             redis_client.setex(
                 rkey(sender, "entity_id"),
                 CHAT_TTL,
-                "EN0001" if text == "1" else "EN0010",
+                entity_id,
             )
-            redis_client.setex(rkey(sender, "state"), CHAT_TTL, STATE_WAITING_FOR_IMAGE_COUNT)
-            send_whatsapp_reply(sender, "How many images does this invoice have?", msg_id)
+            redis_client.setex(
+                rkey(sender, "state"),
+                CHAT_TTL,
+                STATE_WAITING_FOR_IMAGE_COUNT,
+            )
+            send_whatsapp_reply(
+                sender,
+                "How many images does this invoice have?",
+                msg_id,
+            )
             return
 
+        # ---- IMAGE COUNT ----
         if state == STATE_WAITING_FOR_IMAGE_COUNT:
-            redis_client.setex(rkey(sender, "expected_images"), CHAT_TTL, int(text))
-            redis_client.setex(rkey(sender, "received_images"), CHAT_TTL, 0)
+            redis_client.setex(
+                rkey(sender, "expected_images"),
+                CHAT_TTL,
+                int(text),
+            )
+            redis_client.setex(
+                rkey(sender, "received_images"),
+                CHAT_TTL,
+                0,
+            )
             redis_client.delete(rkey(sender, "images"))
-            redis_client.setex(rkey(sender, "state"), CHAT_TTL, STATE_WAITING_FOR_IMAGES)
-            send_whatsapp_reply(sender, f"Please send {text} invoice image(s).", msg_id)
+            redis_client.setex(
+                rkey(sender, "state"),
+                CHAT_TTL,
+                STATE_WAITING_FOR_IMAGES,
+            )
+            send_whatsapp_reply(
+                sender,
+                f"Please send {text} invoice image(s).",
+                msg_id,
+            )
             return
 
-        # 🔥 THIS WAS THE MISSING PART
+        # ---- CLAIM CHOICE ----
         if state == STATE_WAITING_FOR_CLAIM_CHOICE and text in ("1", "2"):
             threading.Thread(
                 target=commit_claim,
@@ -389,6 +574,35 @@ def handle_whatsapp_incoming(data):
                 daemon=True,
             ).start()
             return
+
+        # ---- ADD ANOTHER INVOICE ----
+        if state == STATE_WAITING_FOR_ADD_MORE:
+            if text in ("1", "yes"):
+                redis_client.delete(rkey(sender, "images"))
+                redis_client.delete(rkey(sender, "expected_images"))
+                redis_client.delete(rkey(sender, "received_images"))
+
+                redis_client.setex(
+                    rkey(sender, "state"),
+                    CHAT_TTL,
+                    STATE_WAITING_FOR_IMAGE_COUNT,
+                )
+
+                send_whatsapp_reply(
+                    sender,
+                    "How many images does this invoice have?",
+                    msg_id,
+                )
+                return
+
+            if text in ("2", "done"):
+                send_whatsapp_reply(
+                    sender,
+                    "✅ Claim completed. Thank you!",
+                    msg_id,
+                )
+                clear_session(sender)
+                return
 
     # ---------------- CLAIM MEDIA ----------------
     if msg_type in ("image", "document") and state == STATE_WAITING_FOR_IMAGES:
@@ -420,7 +634,11 @@ def handle_whatsapp_incoming(data):
                 daemon=True,
             ).start()
         else:
-            send_whatsapp_reply(sender, f"📎 Invoice {received}/{expected} received", msg_id)
+            send_whatsapp_reply(
+                sender,
+                f"📎 Invoice {received}/{expected} received",
+                msg_id,
+            )
         return
 
     # ---------------- GRN MEDIA ----------------
@@ -451,3 +669,5 @@ def handle_whatsapp_incoming(data):
             daemon=True,
         ).start()
         return
+
+
