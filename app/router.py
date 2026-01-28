@@ -1,22 +1,51 @@
-# app/router.py
+import os
+import pyodbc
+from dotenv import load_dotenv
 
-from app.constants import SERVICE_CLAIM, SERVICE_GRN
+load_dotenv()
 
+DRIVER = os.getenv("DRIVER")
+SQL_SERVER_HOST = os.getenv("SQL_SERVER_HOST")
+SQL_SERVER_PORT = os.getenv("SQL_SERVER_PORT", "1433")
+SQL_SERVER_USER = os.getenv("SQL_SERVER_USER")
+SQL_SERVER_PASSWORD = os.getenv("SQL_SERVER_PASSWORD")
+SQL_SERVER_DB = os.getenv("SQL_SERVER_DB")  # Dev_ExpenseApp
+
+CONN_STR = (
+    f"DRIVER={DRIVER};"
+    f"SERVER={SQL_SERVER_HOST},{SQL_SERVER_PORT};"
+    f"DATABASE={SQL_SERVER_DB};"
+    f"UID={SQL_SERVER_USER};"
+    f"PWD={SQL_SERVER_PASSWORD};"
+    f"TrustServerCertificate=yes;"
+)
 
 def get_services_for_phone(phone: str) -> list[str]:
     """
-    TEMP: hardcoded for testing
-    Will be replaced with DB query later
+    Returns enabled services for a phone number.
+    Possible returns:
+      ['CLAIM']
+      ['GRN']
+      ['CLAIM', 'GRN']
+      []
     """
 
-    # Your number → both services
-    if phone.endswith("6247"):
-        return [SERVICE_CLAIM, SERVICE_GRN]
+    conn = pyodbc.connect(CONN_STR)
+    cur = conn.cursor()
 
-    # Example GRN-only user
-    if phone.endswith("1111"):
-        return [SERVICE_GRN]
+    cur.execute(
+        """
+        SELECT feature
+        FROM [product].[WhatsappUser]
+        WHERE phone_number = ?
+          AND is_disabled = 0
+        """,
+        phone,
+    )
 
-    # Default → claim only
-    return [SERVICE_CLAIM]
-   
+    rows = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return [row.feature.strip().upper() for row in rows]
