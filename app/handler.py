@@ -96,6 +96,58 @@ def send_whatsapp_reply(to: str, text: str, reply_to: str):
 # --------------------------------------------------
 # DB HELPERS (CLAIM)
 # --------------------------------------------------
+# --------------------------------------------------
+def fetch_expense_mapping(schema):
+    conn = pyodbc.connect(CONN_STR)
+    cur = conn.cursor()
+
+    cur.execute(
+        f"""
+        SELECT
+            et.expense_type_name,
+            est.expense_sub_type_name
+        FROM [{schema}].[ExpenseType] et
+        JOIN [{schema}].[ExpenseSubType] est
+            ON est.expense_type_id = et.expense_type_id
+        WHERE est.is_disabled = 0
+        ORDER BY et.expense_type_name, est.expense_sub_type_name
+        """
+    )
+
+    mapping = {}
+    for et_name, est_name in cur.fetchall():
+        mapping.setdefault(et_name, []).append(est_name)
+
+    cur.close()
+    conn.close()
+    return mapping
+# --------------------------------------------------
+def resolve_expense_ids(schema, expense_type, expense_sub_type):
+    conn = pyodbc.connect(CONN_STR)
+    cur = conn.cursor()
+
+    cur.execute(
+        f"""
+        SELECT
+            est.expense_type_id,
+            est.expense_sub_type_id
+        FROM [{schema}].[ExpenseSubType] est
+        JOIN [{schema}].[ExpenseType] et
+            ON et.expense_type_id = est.expense_type_id
+        WHERE
+            et.expense_type_name = ?
+            AND est.expense_sub_type_name = ?
+            AND est.is_disabled = 0
+        """,
+        expense_type,
+        expense_sub_type,
+    )
+
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return (row.expense_type_id, row.expense_sub_type_id) if row else (None, None)
+# --------------------------------------------------
 def fetch_entities_for_employee(emp_no: int):
     conn = pyodbc.connect(CONN_STR)
     cur = conn.cursor()
@@ -225,10 +277,17 @@ def process_claim_async(phone, reply_to):
         schema = redis_client.get(rkey(phone, "schema"))
         entity_id = redis_client.get(rkey(phone, "entity_id"))
 
+        # 🔹 FETCH DYNAMIC EXPENSE MAPPING (ONCE PER CLAIM)
+        expense_mapping = fetch_expense_mapping(schema)
+
         # ---------- OCR ----------
         extracted = []
         for img in images:
-            extracted.append(run_invoice_ocr(img).get("structured") or {})
+            result = run_invoice_ocr(
+                img,
+                expense_mapping=expense_mapping
+            )
+            extracted.append(result.get("structured") or {})
 
         redis_client.setex(
             rkey(phone, "extracted_bills"),
@@ -248,7 +307,6 @@ def process_claim_async(phone, reply_to):
                 int(active_claim),
             )
 
-            # Directly attach to existing claim
             threading.Thread(
                 target=commit_claim,
                 args=(phone, "1", reply_to),  # force "Add to existing"
@@ -295,13 +353,11 @@ def commit_claim(phone, choice, reply_to):
         images = redis_client.lrange(rkey(phone, "images"), 0, -1)
 
         draft_raw = redis_client.get(rkey(phone, "draft_claim_no"))
-        draft_claim_no = int(draft_raw) if draft_raw else None 
+        draft_claim_no = int(draft_raw) if draft_raw else None
 
         # 🔐 Login
         auth = login_with_phone(phone)
         session_id = auth["session_id"]
-
-        et_id, est_id = resolve_expense_type_ids(schema)
 
         prepared_bills = []
         invoice_amount = 0.0  # amount for THIS upload only
@@ -312,6 +368,21 @@ def commit_claim(phone, choice, reply_to):
 
             from_date = normalize_date(bill.get("from_date"))
             to_date = normalize_date(bill.get("to_date")) or from_date
+
+            # ✅ NEW: resolve expense IDs PER BILL from OCR output
+            expense_type = bill.get("expense_type")
+            expense_sub_type = bill.get("expense_sub_type")
+
+            et_id, est_id = resolve_expense_ids(
+                schema,
+                expense_type,
+                expense_sub_type,
+            )
+
+            if not et_id or not est_id:
+                raise Exception(
+                    f"Invalid expense mapping: {expense_type} → {expense_sub_type}"
+                )
 
             prepared_bills.append({
                 "expense_type_id": et_id,
@@ -329,7 +400,7 @@ def commit_claim(phone, choice, reply_to):
                 "claim_description": "Created via WhatsApp",
                 "emp_id": emp_no,
                 "entity_id": entity_id,
-                "total_claim_amount": invoice_amount,  # backend recalculates anyway
+                "total_claim_amount": invoice_amount,
                 "claim_status": "Drafted",
             },
             "bills": prepared_bills,
@@ -340,7 +411,7 @@ def commit_claim(phone, choice, reply_to):
             "Content-Type": "application/json",
         }
 
-        # 🔥 POST vs PUT      
+        # 🔥 POST vs PUT
         if choice == "1" and draft_claim_no:
             resp = requests.put(
                 f"{CLAIMIFY_API_BASE}/api/claims/{draft_claim_no}",

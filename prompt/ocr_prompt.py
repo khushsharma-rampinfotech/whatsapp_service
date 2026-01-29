@@ -1,71 +1,31 @@
-# prompt.py
+# ocr_prompt.py
 
 # ---------------------------------------------------------
-# EXPENSE TYPE → SUB-TYPE MAPPING
+# FUNCTION: CREATE OCR PROMPT FOR MISTRAL (STRICT MODE)
 # ---------------------------------------------------------
+import json
 
-EXPENSE_MAPPING = {
-    "Vehicle Expenses": [
-        "Fuel (Non Fuel Card)",
-        "Car Clean",
-        "Car Tax",
-        "Car Rentals",
-        "Mileage",
-        "EV Charging",
-        "Car Service",
-        "Car Repair"
-    ],
-
-    "Client, Team and Personal Expenses": [
-        "Client Entertainment",
-        "Meal Allowance",
-        "Food",
-        "Team Meeting",
-        "Customer Meals"
-    ],
-
-    "Miscellaneous": [
-        "Subscriptions",
-        "Stationary Expense",
-        "Phone Expense",
-        "Postage & Carriage"
-    ],
-
-    "Travel & Accommodation Expenses": [
-        "Other Means of Travel",
-        "Fuel (Non Fuel Card)",
-        "Mileage",
-        "Airfare",
-        "Buses",
-        "Parking and Tolls",
-        "Taxis",
-        "Rail",
-        "EV Charging",
-        "Accommodation"
-    ],
-
-    "Advertising & Sales Promotion": [
-        "Trade Show",
-        "Canopy"
-    ],
-
-    "Materials Purchased": [
-        "Material Purchase"
-    ]
-}
-
-
-# ---------------------------------------------------------
-# FUNCTION: CREATE OCR PROMPT FOR MISTRAL
-# ---------------------------------------------------------
-def get_ocr_prompt():
+def get_ocr_prompt(expense_mapping: dict):
     return f"""
-You are an expert invoice reader. Extract information from the provided invoice image.
+You are an automated expense classification engine.
 
-Return ONLY valid JSON. No explanations.
+You MUST return ONLY valid JSON.
+Do NOT include explanations, comments, markdown, or extra text.
 
-Extract these fields:
+You MUST classify the expense using ONLY the mapping provided below.
+You are STRICTLY FORBIDDEN from inventing new expense types or sub-types.
 
+You MUST ALWAYS choose:
+- ONE expense_type from the mapping keys
+- ONE expense_sub_type that belongs ONLY to that expense_type
+
+If multiple options seem valid, choose the CLOSEST and MOST REASONABLE match
+based on the invoice content (merchant, description, items, context).
+
+Expense Type → Sub-Type Mapping (SOURCE OF TRUTH):
+{json.dumps(expense_mapping, indent=2)}
+
+You MUST extract EXACTLY these fields:
 - expense_type
 - expense_sub_type
 - merchant_name
@@ -75,12 +35,25 @@ Extract these fields:
 - amount
 - VAT
 
-Expense Type → Sub-Type mapping:
-{EXPENSE_MAPPING}
+STRICT RULES:
+- expense_type MUST be one of the keys in the mapping
+- expense_sub_type MUST belong to the selected expense_type ONLY
+- NEVER mix sub-types across expense types
+- NEVER return UNKNOWN
+- NEVER leave expense_type or expense_sub_type empty
+- Dates format: DD/MM/YYYY or YYYY-MM-DD
+- Amount & VAT: numeric only (no currency symbols)
+- If a value is missing, return empty string ""
 
-Rules:
-- Always classify the correct expense_type and expense_sub_type based on product/service.
-- Dates must be in DD/MM/YYYY or YYYY-MM-DD if possible.
-- Amount should be numeric without currency symbol if possible.
-- If something is missing, return empty string "".
+EXPECTED JSON FORMAT (RETURN EXACTLY THIS STRUCTURE):
+{{
+  "expense_type": "",
+  "expense_sub_type": "",
+  "merchant_name": "",
+  "invoice_number": "",
+  "from_date": "",
+  "to_date": "",
+  "amount": "",
+  "VAT": ""
+}}
 """

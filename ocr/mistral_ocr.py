@@ -70,11 +70,11 @@ def _ocr_image(image_path: str) -> dict:
 # ============================================================
 # INTERNAL: STRUCTURED EXTRACTION (RESTORED LLM STEP)
 # ============================================================
-def _extract_structured_data(raw_text: str) -> dict:
+def _extract_structured_data(raw_text: str, expense_mapping: dict) -> dict:
     if not raw_text.strip():
         return {}
 
-    prompt = get_ocr_prompt() + "\n\nText:\n" + raw_text
+    prompt = get_ocr_prompt(expense_mapping) + "\n\nText:\n" + raw_text
     headers = {
         "Authorization": f"Bearer {MISTRAL_API_KEY}",
         "Content-Type": "application/json",
@@ -136,10 +136,10 @@ def _convert_pdf_to_images(pdf_path: str) -> list[str]:
 # ============================================================
 # PUBLIC: RUN INVOICE OCR (FINAL)
 # ============================================================
-def run_invoice_ocr(file_path: str) -> dict:
+def run_invoice_ocr(file_path: str, expense_mapping: dict) -> dict:
     """
     Returns:
-    {
+    { 
         raw_text: str,
         structured: dict,
         model: str
@@ -164,7 +164,7 @@ def run_invoice_ocr(file_path: str) -> dict:
         result = _ocr_image(file_path)
         raw_text = result.get("raw_text", "")
 
-    structured = _extract_structured_data(raw_text)
+    structured = _extract_structured_data(raw_text, expense_mapping)
 
     if not structured:
         print("⚠️ OCR EMPTY — USING FALLBACK VALUES")
