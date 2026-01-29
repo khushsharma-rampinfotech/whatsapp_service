@@ -53,3 +53,8 @@ async def receive_message(request: Request):
     except Exception as e:
         print("❌ Webhook error:", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host="0.0.0.0", port=50103, reload=True)

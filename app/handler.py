@@ -161,6 +161,7 @@ def fetch_entities_for_employee(emp_no: int):
         JOIN zeus_t1.EntityMaster em
             ON em.entity_id = eem.entity_id
         WHERE eem.emp_no = ?
+          AND eem.role_id = 4
           AND (eem.is_disabled = 0 OR eem.is_disabled IS NULL)
           AND em.deleted_on IS NULL
         ORDER BY em.entity_name
@@ -324,13 +325,22 @@ def process_claim_async(phone, reply_to):
             STATE_WAITING_FOR_CLAIM_CHOICE,
         )
 
-        send_whatsapp_reply(
-            phone,
-            f"📝 Draft claim found (Claim No: {draft})\n1️⃣ Add to existing\n2️⃣ Create new"
-            if draft else
-            "ℹ️ No draft claim found\n2️⃣ Create new claim",
-            reply_to,
-        )
+        # ✅ OPTION B UX FIX
+        if draft:
+            send_whatsapp_reply(
+                phone,
+                f"📝 Draft claim found (Claim No: {draft})\n"
+                "1️⃣ Add to existing\n"
+                "2️⃣ Create new",
+                reply_to,
+            )
+        else:
+            send_whatsapp_reply(
+                phone,
+                " No draft claim found\n"
+                "1️⃣ Create new claim",
+                reply_to,
+            )
 
     except Exception as e:
         send_whatsapp_reply(
@@ -338,7 +348,6 @@ def process_claim_async(phone, reply_to):
             f"❌ OCR failed.\n{e}",
             reply_to,
         )
-
 
 # --------------------------------------------------
 # CLAIM COMMIT (FINAL STEP)
@@ -522,34 +531,18 @@ def handle_whatsapp_incoming(data):
             redis_client.setex(rkey(sender, "emp_no"), CHAT_TTL, emp_no)
             redis_client.setex(rkey(sender, "schema"), CHAT_TTL, tenant)
 
-            # 🔥 Fetch enabled services (DB stores full WhatsApp number)
             services = get_services_for_phone(sender)
             service_set = set(services)
 
-            # 🚨 HARD GUARD — no silent fallback
             if not service_set:
-                send_whatsapp_reply(
-                    sender,
-                    "❌ You are not enabled for any service.",
-                    msg_id,
-                )
+                send_whatsapp_reply(sender, "❌ You are not enabled for any service.", msg_id)
                 return
 
-            # ---- ONLY GRN ----
             if service_set == {"GRN"}:
-                redis_client.setex(
-                    rkey(sender, "state"),
-                    CHAT_TTL,
-                    STATE_WAITING_FOR_GRN_UPLOAD,
-                )
-                send_whatsapp_reply(
-                    sender,
-                    "📎 Please send GRN image or PDF.",
-                    msg_id,
-                )
+                redis_client.setex(rkey(sender, "state"), CHAT_TTL, STATE_WAITING_FOR_GRN_UPLOAD)
+                send_whatsapp_reply(sender, "📎 Please send GRN image or PDF.", msg_id)
                 return
 
-            # ---- ONLY CLAIM ----
             if service_set == {"CLAIM"}:
                 entities = fetch_entities_for_employee(emp_no)
                 if not entities:
@@ -561,16 +554,8 @@ def handle_whatsapp_incoming(data):
                     clear_session(sender)
                     return
 
-                redis_client.setex(
-                    rkey(sender, "entities"),
-                    CHAT_TTL,
-                    json.dumps(entities),
-                )
-                redis_client.setex(
-                    rkey(sender, "state"),
-                    CHAT_TTL,
-                    STATE_WAITING_FOR_ENTITY,
-                )
+                redis_client.setex(rkey(sender, "entities"), CHAT_TTL, json.dumps(entities))
+                redis_client.setex(rkey(sender, "state"), CHAT_TTL, STATE_WAITING_FOR_ENTITY)
 
                 lines = ["Select entity:"]
                 for idx, e in enumerate(entities, start=1):
@@ -579,13 +564,8 @@ def handle_whatsapp_incoming(data):
                 send_whatsapp_reply(sender, "\n".join(lines), msg_id)
                 return
 
-            # ---- BOTH (CLAIM + GRN) ----
             if service_set == {"CLAIM", "GRN"}:
-                redis_client.setex(
-                    rkey(sender, "state"),
-                    CHAT_TTL,
-                    STATE_WAITING_FOR_SERVICE,
-                )
+                redis_client.setex(rkey(sender, "state"), CHAT_TTL, STATE_WAITING_FOR_SERVICE)
                 send_whatsapp_reply(
                     sender,
                     "Which service do you want?\n"
@@ -595,7 +575,6 @@ def handle_whatsapp_incoming(data):
                 )
                 return
 
-            # ---- SAFETY NET (should never hit) ----
             send_whatsapp_reply(
                 sender,
                 "❌ Invalid service configuration. Please contact support.",
@@ -603,7 +582,7 @@ def handle_whatsapp_incoming(data):
             )
             return
 
-        # ---- SERVICE SELECTION (ONLY for dual-service users) ----
+        # ---- SERVICE SELECTION ----
         if state == STATE_WAITING_FOR_SERVICE:
             if text == "1":
                 emp_no = int(redis_client.get(rkey(sender, "emp_no")))
@@ -618,16 +597,8 @@ def handle_whatsapp_incoming(data):
                     clear_session(sender)
                     return
 
-                redis_client.setex(
-                    rkey(sender, "entities"),
-                    CHAT_TTL,
-                    json.dumps(entities),
-                )
-                redis_client.setex(
-                    rkey(sender, "state"),
-                    CHAT_TTL,
-                    STATE_WAITING_FOR_ENTITY,
-                )
+                redis_client.setex(rkey(sender, "entities"), CHAT_TTL, json.dumps(entities))
+                redis_client.setex(rkey(sender, "state"), CHAT_TTL, STATE_WAITING_FOR_ENTITY)
 
                 lines = ["Select entity:"]
                 for idx, e in enumerate(entities, start=1):
@@ -637,16 +608,8 @@ def handle_whatsapp_incoming(data):
                 return
 
             if text == "2":
-                redis_client.setex(
-                    rkey(sender, "state"),
-                    CHAT_TTL,
-                    STATE_WAITING_FOR_GRN_UPLOAD,
-                )
-                send_whatsapp_reply(
-                    sender,
-                    "📎 Please send GRN image or PDF.",
-                    msg_id,
-                )
+                redis_client.setex(rkey(sender, "state"), CHAT_TTL, STATE_WAITING_FOR_GRN_UPLOAD)
+                send_whatsapp_reply(sender, "📎 Please send GRN image or PDF.", msg_id)
                 return
 
         # ---- ENTITY ----
@@ -662,25 +625,13 @@ def handle_whatsapp_incoming(data):
                 idx = int(text) - 1
                 entity_id = entities[idx]["entity_id"]
             except (ValueError, IndexError):
-                send_whatsapp_reply(
-                    sender,
-                    "❌ Invalid selection. Please choose a valid number.",
-                    msg_id,
-                )
+                send_whatsapp_reply(sender, "❌ Invalid selection. Please choose a valid number.", msg_id)
                 return
 
             redis_client.setex(rkey(sender, "entity_id"), CHAT_TTL, entity_id)
-            redis_client.setex(
-                rkey(sender, "state"),
-                CHAT_TTL,
-                STATE_WAITING_FOR_IMAGE_COUNT,
-            )
+            redis_client.setex(rkey(sender, "state"), CHAT_TTL, STATE_WAITING_FOR_IMAGE_COUNT)
 
-            send_whatsapp_reply(
-                sender,
-                "How many images does this invoice have?",
-                msg_id,
-            )
+            send_whatsapp_reply(sender, "How many images does this invoice have?", msg_id)
             return
 
         # ---- IMAGE COUNT ----
@@ -689,26 +640,36 @@ def handle_whatsapp_incoming(data):
             redis_client.setex(rkey(sender, "received_images"), CHAT_TTL, 0)
             redis_client.delete(rkey(sender, "images"))
 
-            redis_client.setex(
-                rkey(sender, "state"),
-                CHAT_TTL,
-                STATE_WAITING_FOR_IMAGES,
-            )
+            redis_client.setex(rkey(sender, "state"), CHAT_TTL, STATE_WAITING_FOR_IMAGES)
+            send_whatsapp_reply(sender, f"Please send {text} invoice image(s).", msg_id)
+            return
+
+        # ---- CLAIM CHOICE (✅ OPTION B FIX) ----
+        if state == STATE_WAITING_FOR_CLAIM_CHOICE:
+            draft_raw = redis_client.get(rkey(sender, "draft_claim_no"))
+            has_draft = bool(draft_raw)
+
+            if has_draft and text in ("1", "2"):
+                threading.Thread(
+                    target=commit_claim,
+                    args=(sender, text, msg_id),
+                    daemon=True,
+                ).start()
+                return
+
+            if not has_draft and text == "1":
+                threading.Thread(
+                    target=commit_claim,
+                    args=(sender, "2", msg_id),  # force Create New
+                    daemon=True,
+                ).start()
+                return
 
             send_whatsapp_reply(
                 sender,
-                f"Please send {text} invoice image(s).",
+                "❌ Invalid option. Please choose a valid number.",
                 msg_id,
             )
-            return
-
-        # ---- CLAIM CHOICE ----
-        if state == STATE_WAITING_FOR_CLAIM_CHOICE and text in ("1", "2"):
-            threading.Thread(
-                target=commit_claim,
-                args=(sender, text, msg_id),
-                daemon=True,
-            ).start()
             return
 
         # ---- ADD ANOTHER INVOICE ----
@@ -718,25 +679,12 @@ def handle_whatsapp_incoming(data):
                 redis_client.delete(rkey(sender, "expected_images"))
                 redis_client.delete(rkey(sender, "received_images"))
 
-                redis_client.setex(
-                    rkey(sender, "state"),
-                    CHAT_TTL,
-                    STATE_WAITING_FOR_IMAGE_COUNT,
-                )
-
-                send_whatsapp_reply(
-                    sender,
-                    "How many images does this invoice have?",
-                    msg_id,
-                )
+                redis_client.setex(rkey(sender, "state"), CHAT_TTL, STATE_WAITING_FOR_IMAGE_COUNT)
+                send_whatsapp_reply(sender, "How many images does this invoice have?", msg_id)
                 return
 
             if text in ("2", "done"):
-                send_whatsapp_reply(
-                    sender,
-                    "✅ Claim completed. Thank you!",
-                    msg_id,
-                )
+                send_whatsapp_reply(sender, "✅ Claim completed. Thank you!", msg_id)
                 clear_session(sender)
                 return
 
@@ -770,11 +718,7 @@ def handle_whatsapp_incoming(data):
                 daemon=True,
             ).start()
         else:
-            send_whatsapp_reply(
-                sender,
-                f"📎 Invoice {received}/{expected} received",
-                msg_id,
-            )
+            send_whatsapp_reply(sender, f"📎 Invoice {received}/{expected} received", msg_id)
         return
 
     # ---------------- GRN MEDIA ----------------
@@ -805,5 +749,3 @@ def handle_whatsapp_incoming(data):
             daemon=True,
         ).start()
         return
-
-
